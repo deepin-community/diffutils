@@ -1,0 +1,4 @@
+01-fix-race-condition-in-colors-test.patch
+02-disable-colors-test.patch
+03-translations.patch
+fix-c-stack-stop-using-SIGSTKSZ.patch
