@@ -1,11 +1,11 @@
 #! /bin/sh
 # Test suite for exclude.
-# Copyright (C) 2010-2018 Free Software Foundation, Inc.
+# Copyright (C) 2010-2023 Free Software Foundation, Inc.
 # This file is part of the GNUlib Library.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 3 of the License, or
+# the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
@@ -32,7 +32,7 @@ file: 0
 bar: 1
 EOT
 
-test-exclude -wildcards in -- 'f*e' 'file' 'bar' > out || exit $?
+${CHECKER} test-exclude -wildcards in -- 'f*e' 'file' 'bar' > out || exit $?
 
 # Find out how to remove carriage returns from output. Solaris /usr/ucb/tr
 # does not understand '\r'.

@@ -1,11 +1,11 @@
 #! /bin/sh
 # Test suite for exclude.
-# Copyright (C) 2009-2018 Free Software Foundation, Inc.
+# Copyright (C) 2009-2023 Free Software Foundation, Inc.
 # This file is part of the GNUlib Library.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 3 of the License, or
+# the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
@@ -36,7 +36,7 @@ baz: 1
 bar/qux: 0
 EOT
 
-test-exclude -casefold in -- foo 'foo*' bar foobar baz bar/qux > out || exit $?
+${CHECKER} test-exclude -casefold in -- foo 'foo*' bar foobar baz bar/qux > out || exit $?
 
 # Find out how to remove carriage returns from output. Solaris /usr/ucb/tr
 # does not understand '\r'.
