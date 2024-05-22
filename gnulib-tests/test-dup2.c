@@ -1,9 +1,9 @@
 /* Test duplicating file descriptors.
-   Copyright (C) 2009-2018 Free Software Foundation, Inc.
+   Copyright (C) 2009-2023 Free Software Foundation, Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; either version 3 of the License, or
+   the Free Software Foundation, either version 3 of the License, or
    (at your option) any later version.
 
    This program is distributed in the hope that it will be useful,
@@ -50,6 +50,12 @@ SIGNATURE_CHECK (dup2, int, (int, int));
 
 #include "macros.h"
 
+/* Tell GCC not to warn about the specific edge cases tested here.  */
+#if __GNUC__ >= 13
+# pragma GCC diagnostic ignored "-Wanalyzer-fd-leak"
+# pragma GCC diagnostic ignored "-Wanalyzer-fd-use-without-check"
+#endif
+
 /* Return non-zero if FD is open.  */
 static int
 is_open (int fd)
@@ -92,7 +98,7 @@ is_inheritable (int fd)
 #endif /* GNULIB_TEST_CLOEXEC */
 
 #if !O_BINARY
-# define setmode(f,m) zero ()
+# define set_binary_mode(f,m) zero ()
 static int zero (void) { return 0; }
 #endif
 
@@ -101,8 +107,8 @@ static int zero (void) { return 0; }
 static int
 is_mode (int fd, int mode)
 {
-  int value = setmode (fd, O_BINARY);
-  setmode (fd, value);
+  int value = set_binary_mode (fd, O_BINARY);
+  set_binary_mode (fd, value);
   return mode == value;
 }
 
@@ -203,11 +209,11 @@ main (void)
 
   /* On systems that distinguish between text and binary mode, dup2
      reuses the mode of the source.  */
-  setmode (fd, O_BINARY);
+  set_binary_mode (fd, O_BINARY);
   ASSERT (is_mode (fd, O_BINARY));
   ASSERT (dup2 (fd, fd + 1) == fd + 1);
   ASSERT (is_mode (fd + 1, O_BINARY));
-  setmode (fd, O_TEXT);
+  set_binary_mode (fd, O_TEXT);
   ASSERT (is_mode (fd, O_TEXT));
   ASSERT (dup2 (fd, fd + 1) == fd + 1);
   ASSERT (is_mode (fd + 1, O_TEXT));

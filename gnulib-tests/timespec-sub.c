@@ -1,10 +1,10 @@
 /* Subtract two struct timespec values.
 
-   Copyright (C) 2011-2018 Free Software Foundation, Inc.
+   Copyright (C) 2011-2023 Free Software Foundation, Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; either version 3 of the License, or
+   the Free Software Foundation, either version 3 of the License, or
    (at your option) any later version.
 
    This program is distributed in the hope that it will be useful,
@@ -24,6 +24,7 @@
 #include <config.h>
 #include "timespec.h"
 
+#include <stdckdint.h>
 #include "intprops.h"
 
 struct timespec
@@ -33,36 +34,30 @@ timespec_sub (struct timespec a, struct timespec b)
   time_t bs = b.tv_sec;
   int ns = a.tv_nsec - b.tv_nsec;
   int rns = ns;
-  time_t tmin = TYPE_MINIMUM (time_t);
-  time_t tmax = TYPE_MAXIMUM (time_t);
 
   if (ns < 0)
     {
       rns = ns + TIMESPEC_HZ;
-      if (bs < tmax)
-        bs++;
+      time_t bs1;
+      if (!ckd_add (&bs1, bs, 1))
+        bs = bs1;
       else if (- TYPE_SIGNED (time_t) < rs)
         rs--;
       else
         goto low_overflow;
     }
 
-  /* INT_SUBTRACT_WRAPV is not appropriate since time_t might be unsigned.
-     In theory time_t might be narrower than int, so plain
-     INT_SUBTRACT_OVERFLOW does not suffice.  */
-  if (! INT_SUBTRACT_OVERFLOW (rs, bs) && tmin <= rs - bs && rs - bs <= tmax)
-    rs -= bs;
-  else
+  if (ckd_sub (&rs, rs, bs))
     {
-      if (rs < 0)
+      if (0 < bs)
         {
         low_overflow:
-          rs = tmin;
+          rs = TYPE_MINIMUM (time_t);
           rns = 0;
         }
       else
         {
-          rs = tmax;
+          rs = TYPE_MAXIMUM (time_t);
           rns = TIMESPEC_HZ - 1;
         }
     }

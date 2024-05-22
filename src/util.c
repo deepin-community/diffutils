@@ -1,7 +1,7 @@
 /* Support routines for GNU DIFF.
 
    Copyright (C) 1988-1989, 1992-1995, 1998, 2001-2002, 2004, 2006, 2009-2013,
-   2015-2018 Free Software Foundation, Inc.
+   2015-2023 Free Software Foundation, Inc.
 
    This file is part of GNU DIFF.
 
@@ -19,23 +19,25 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
 
 #include "diff.h"
-#include "argmatch.h"
-#include "die.h"
+
+#include <argmatch.h>
+#include <die.h>
 #include <dirname.h>
 #include <error.h>
+#include <flexmember.h>
 #include <system-quote.h>
 #include <xalloc.h>
-#include "xvasprintf.h"
+
+#include <stdarg.h>
 #include <signal.h>
 
 /* Use SA_NOCLDSTOP as a proxy for whether the sigaction machinery is
    present.  */
 #ifndef SA_NOCLDSTOP
 # define SA_NOCLDSTOP 0
-# define sigprocmask(How, Set, Oset) /* empty */
-# define sigset_t int
+# define sigprocmask(How, Set, Oset) 0
 # if ! HAVE_SIGINTERRUPT
-#  define siginterrupt(sig, flag) /* empty */
+#  define siginterrupt(sig, flag) 0
 # endif
 #endif
 
@@ -51,7 +53,15 @@ char const pr_program[] = PR_PROGRAM;
 struct msg
 {
   struct msg *next;
-  char args[1]; /* Format + 4 args, each '\0' terminated, concatenated.  */
+
+  /* Msgid of printf-style format.  */
+  char const *msgid;
+
+  /* Number of bytes in ARGS.  */
+  size_t argbytes;
+
+  /* Arg strings, each '\0' terminated, concatenated.  */
+  char args[FLEXIBLE_ARRAY_MEMBER];
 };
 
 /* Head of the chain of queues messages.  */
@@ -91,40 +101,43 @@ fatal (char const *msgid)
 }
 
 /* Like printf, except if -l in effect then save the message and print later.
+   Also, all arguments must be char * or char const *.
    This is used for things like "Only in ...".  */
 
 void
-message (char const *format_msgid, char const *arg1, char const *arg2)
+message (char const *format_msgid, ...)
 {
-  message5 (format_msgid, arg1, arg2, 0, 0);
-}
+  va_list ap;
+  va_start (ap, format_msgid);
 
-void
-message5 (char const *format_msgid, char const *arg1, char const *arg2,
-	  char const *arg3, char const *arg4)
-{
   if (paginate)
     {
-      char *p;
-      char const *arg[5];
-      int i;
-      size_t size[5];
-      size_t total_size = offsetof (struct msg, args);
-      struct msg *new;
+      size_t argbytes = 0;
 
-      arg[0] = format_msgid;
-      arg[1] = arg1;
-      arg[2] = arg2;
-      arg[3] = arg3 ? arg3 : "";
-      arg[4] = arg4 ? arg4 : "";
+      for (char const *m = format_msgid; *m; m++)
+	if (*m == '%')
+	  {
+	    if (m[1] == '%')
+	      m++;
+	    else
+	      argbytes += strlen (va_arg (ap, char const *)) + 1;
+	  }
+      va_end (ap);
 
-      for (i = 0;  i < 5;  i++)
-	total_size += size[i] = strlen (arg[i]) + 1;
+      struct msg *new = xmalloc (FLEXSIZEOF (struct msg, args, argbytes));
+      new->msgid = format_msgid;
+      new->argbytes = argbytes;
 
-      new = xmalloc (total_size);
-
-      for (i = 0, p = new->args;  i < 5;  p += size[i++])
-	memcpy (p, arg[i], size[i]);
+      va_start (ap, format_msgid);
+      char *p = new->args;
+      for (char const *m = format_msgid; *m; m++)
+	if (*m == '%')
+	  {
+	    if (m[1] == '%')
+	      m++;
+	    else
+	      p = stpcpy (p, va_arg (ap, char const *)) + 1;
+	  }
 
       *msg_chain_end = new;
       new->next = 0;
@@ -133,9 +146,11 @@ message5 (char const *format_msgid, char const *arg1, char const *arg2,
   else
     {
       if (sdiff_merge_assist)
-	putchar (' ');
-      printf (_(format_msgid), arg1, arg2, arg3, arg4);
+        putchar (' ');
+      vprintf (_(format_msgid), ap);
     }
+
+  va_end (ap);
 }
 
 /* Output all the messages that were saved up by calls to 'message'.  */
@@ -143,32 +158,74 @@ message5 (char const *format_msgid, char const *arg1, char const *arg2,
 void
 print_message_queue (void)
 {
-  char const *arg[5];
-  int i;
-  struct msg *m = msg_chain;
-
-  while (m)
+  for (struct msg *m = msg_chain; m; )
     {
+      /* Change this if diff ever has messages with more than 4 args.  */
+      char const *p = m->args;
+      char const *plim = p + m->argbytes;
+      /* Unroll the loop to work around GCC 12 bug with
+	 -Wanalyzer-use-of-uninitialized-value.  */
+      char const *arg0 = p; p += p < plim ? strlen (p) + 1 : 0;
+      char const *arg1 = p; p += p < plim ? strlen (p) + 1 : 0;
+      char const *arg2 = p; p += p < plim ? strlen (p) + 1 : 0;
+      char const *arg3 = p; p += p < plim ? strlen (p) + 1 : 0;
+      printf (_(m->msgid), arg0, arg1, arg2, arg3);
+      if (p < plim)
+	abort ();
       struct msg *next = m->next;
-      arg[0] = m->args;
-      for (i = 0;  i < 4;  i++)
-	arg[i + 1] = arg[i] + strlen (arg[i]) + 1;
-      printf (_(arg[0]), arg[1], arg[2], arg[3], arg[4]);
       free (m);
       m = next;
     }
 }
-
-/* The set of signals that are caught.  */
 
+/* Signal handling, needed for restoring default colors.  */
+
+static void
+xsigaddset (sigset_t *set, int sig)
+{
+  if (sigaddset (set, sig) != 0)
+    pfatal_with_name ("sigaddset");
+}
+
+static bool
+xsigismember (sigset_t const *set, int sig)
+{
+  int mem = sigismember (set, sig);
+  if (mem < 0)
+    pfatal_with_name ("sigismember");
+  assume (mem <= 1);
+  return mem;
+}
+
+typedef void (*signal_handler) (int);
+static signal_handler
+xsignal (int sig, signal_handler func)
+{
+  signal_handler h = signal (sig, func);
+  if (h == SIG_ERR)
+    pfatal_with_name ("signal");
+  return h;
+}
+
+static void
+xsigprocmask (int how, sigset_t const *restrict set, sigset_t *restrict oset)
+{
+  if (sigprocmask (how, set, oset) != 0)
+    pfatal_with_name ("sigprocmask");
+}
+
+/* If true, some signals are caught.  This is separate from
+   'caught_signals' because POSIX doesn't require an all-zero sigset_t
+   to be valid.  */
+static bool some_signals_caught;
+
+/* The set of signals that are caught.  */
 static sigset_t caught_signals;
 
 /* If nonzero, the value of the pending fatal signal.  */
-
 static sig_atomic_t volatile interrupt_signal;
 
 /* A count of the number of pending stop signals that have been received.  */
-
 static sig_atomic_t volatile stop_signal_count;
 
 /* An ordinary signal was received; arrange for the program to exit.  */
@@ -201,21 +258,17 @@ stophandler (int sig)
 static void
 process_signals (void)
 {
-  while (interrupt_signal || stop_signal_count)
+  while (interrupt_signal | stop_signal_count)
     {
-      int sig;
-      int stops;
-      sigset_t oldset;
-
       set_color_context (RESET_CONTEXT);
       fflush (stdout);
 
-      sigprocmask (SIG_BLOCK, &caught_signals, &oldset);
+      sigset_t oldset;
+      xsigprocmask (SIG_BLOCK, &caught_signals, &oldset);
 
-      /* Reload interrupt_signal and stop_signal_count, in case a new
-         signal was handled before sigprocmask took effect.  */
-      sig = interrupt_signal;
-      stops = stop_signal_count;
+      /* Reload stop_signal_count and (if needed) interrupt_signal, in
+	 case a new signal was handled before sigprocmask took effect.  */
+      int stops = stop_signal_count, sig;
 
       /* SIGTSTP is special, since the application can receive that signal
          more than once.  In this case, don't set the signal handler to the
@@ -226,82 +279,122 @@ process_signals (void)
           sig = SIGSTOP;
         }
       else
-        signal (sig, SIG_DFL);
+	{
+	  sig = interrupt_signal;
+	  xsignal (sig, SIG_DFL);
+	}
 
       /* Exit or suspend the program.  */
-      raise (sig);
-      sigprocmask (SIG_SETMASK, &oldset, NULL);
+      if (raise (sig) != 0)
+	pfatal_with_name ("raise");
+      xsigprocmask (SIG_SETMASK, &oldset, nullptr);
 
       /* If execution reaches here, then the program has been
          continued (after being suspended).  */
     }
 }
 
+/* The signals that can be caught, the number of such signals,
+   and which of them are actually caught.  */
+static int const sig[] =
+  {
+#ifdef SIGTSTP
+    /* This one is handled specially; see is_tstp_index.  */
+    SIGTSTP,
+#endif
+
+    /* The usual suspects.  */
+#ifdef SIGALRM
+    SIGALRM,
+#endif
+    SIGHUP, SIGINT, SIGPIPE,
+#ifdef SIGQUIT
+    SIGQUIT,
+#endif
+    SIGTERM,
+#ifdef SIGPOLL
+    SIGPOLL,
+#endif
+#ifdef SIGPROF
+    SIGPROF,
+#endif
+#ifdef SIGVTALRM
+    SIGVTALRM,
+#endif
+#ifdef SIGXCPU
+    SIGXCPU,
+#endif
+#ifdef SIGXFSZ
+    SIGXFSZ,
+#endif
+  };
+enum { nsigs = sizeof (sig) / sizeof *(sig) };
+
+/* True if sig[j] == SIGTSTP.  */
+static bool
+is_tstp_index (int j)
+{
+#ifdef SIGTSTP
+  return j == 0;
+#else
+  return false;
+#endif
+}
+
 static void
 install_signal_handlers (void)
 {
-  /* The signals that are trapped, and the number of such signals.  */
-  static int const sig[] =
-    {
-      /* This one is handled specially.  */
-      SIGTSTP,
+  if (sigemptyset (&caught_signals) != 0)
+    pfatal_with_name ("sigemptyset");
 
-      /* The usual suspects.  */
-      SIGALRM, SIGHUP, SIGINT, SIGPIPE, SIGQUIT, SIGTERM,
-#ifdef SIGPOLL
-      SIGPOLL,
-#endif
-#ifdef SIGPROF
-      SIGPROF,
-#endif
-#ifdef SIGVTALRM
-      SIGVTALRM,
-#endif
-#ifdef SIGXCPU
-      SIGXCPU,
-#endif
-#ifdef SIGXFSZ
-      SIGXFSZ,
-#endif
-    };
-  enum { nsigs = sizeof (sig) / sizeof *(sig) };
-
-#if ! SA_NOCLDSTOP
-  bool caught_sig[nsigs];
-#endif
-  {
-    int j;
 #if SA_NOCLDSTOP
-    struct sigaction act;
+  for (int j = 0; j < nsigs; j++)
+    {
+      struct sigaction actj;
+      if (sigaction (sig[j], nullptr, &actj) == 0 && actj.sa_handler != SIG_IGN)
+	xsigaddset (&caught_signals, sig[j]);
+    }
 
-    sigemptyset (&caught_signals);
-    for (j = 0; j < nsigs; j++)
+  struct sigaction act;
+  act.sa_mask = caught_signals;
+  act.sa_flags = SA_RESTART;
+
+  for (int j = 0; j < nsigs; j++)
+    if (xsigismember (&caught_signals, sig[j]))
       {
-        sigaction (sig[j], NULL, &act);
-        if (act.sa_handler != SIG_IGN)
-          sigaddset (&caught_signals, sig[j]);
+	act.sa_handler = is_tstp_index (j) ? stophandler : sighandler;
+	if (sigaction (sig[j], &act, nullptr) != 0)
+	  pfatal_with_name ("sigaction");
+	some_signals_caught = true;
       }
-
-    act.sa_mask = caught_signals;
-    act.sa_flags = SA_RESTART;
-
-    for (j = 0; j < nsigs; j++)
-      if (sigismember (&caught_signals, sig[j]))
-        {
-          act.sa_handler = sig[j] == SIGTSTP ? stophandler : sighandler;
-          sigaction (sig[j], &act, NULL);
-        }
 #else
-    for (j = 0; j < nsigs; j++)
-      {
-        caught_sig[j] = (signal (sig[j], SIG_IGN) != SIG_IGN);
-        if (caught_sig[j])
-          {
-            signal (sig[j], sig[j] == SIGTSTP ? stophandler : sighandler);
-            siginterrupt (sig[j], 0);
-          }
-      }
+  for (int j = 0; j < nsigs; j++)
+    {
+      signal_handler h = signal (sig[j], SIG_IGN);
+      if (h != SIG_IGN && h != SIG_ERR)
+	{
+	  xsigaddset (&caught_signals, sig[j]);
+	  xsignal (sig[j], is_tstp_index (j) ? stophandler : sighandler);
+	  some_signals_caught = true;
+	  if (siginterrupt (sig[j], 0) != 0)
+	    pfatal_with_name ("siginterrupt");
+	}
+    }
 #endif
+}
+
+/* Clean up signal handlers just before exiting the program.  Do this
+   by resetting signal actions back to default, and then processing
+   any signals that arrived before resetting.  */
+void
+cleanup_signal_handlers (void)
+{
+  if (some_signals_caught)
+    {
+      for (int j = 0; j < nsigs; j++)
+	if (xsigismember (&caught_signals, sig[j]))
+	  xsignal (sig[j], SIG_DFL);
+      process_signals ();
     }
 }
 
@@ -310,7 +403,7 @@ static char const *current_name1;
 static bool currently_recursive;
 static bool colors_enabled;
 
-static struct color_ext_type *color_ext_list = NULL;
+static struct color_ext_type *color_ext_list = nullptr;
 
 struct bin_str
   {
@@ -549,7 +642,7 @@ static struct bin_str color_indicator[] =
   {
     { LEN_STR_PAIR ("\033[") },		/* lc: Left of color sequence */
     { LEN_STR_PAIR ("m") },		/* rc: Right of color sequence */
-    { 0, NULL },			/* ec: End color (replaces lc+rs+rc) */
+    { 0, nullptr },			/* ec: End color (replaces lc+rs+rc) */
     { LEN_STR_PAIR ("0") },		/* rs: Reset to ordinary colors */
     { LEN_STR_PAIR ("1") },		/* hd: Header */
     { LEN_STR_PAIR ("32") },		/* ad: Add line */
@@ -559,7 +652,7 @@ static struct bin_str color_indicator[] =
 
 static const char *const indicator_name[] =
   {
-    "lc", "rc", "ec", "rs", "hd", "ad", "de", "ln", NULL
+    "lc", "rc", "ec", "rs", "hd", "ad", "de", "ln", nullptr
   };
 ARGMATCH_VERIFY (indicator_name, color_indicator);
 
@@ -578,14 +671,14 @@ parse_diff_color (void)
   const char *p;		/* Pointer to character being parsed */
   char *buf;			/* color_buf buffer pointer */
   int ind_no;			/* Indicator number */
-  char label[3];		/* Indicator label */
+  char label[] = "??";		/* Indicator label */
   struct color_ext_type *ext;	/* Extension we are working on */
 
-  if ((p = color_palette) == NULL || *p == '\0')
+  p = color_palette;
+  if (p == nullptr || *p == '\0')
     return;
 
-  ext = NULL;
-  strcpy (label, "??");
+  ext = nullptr;
 
   /* This is an overly conservative estimate, but any possible
      --palette string will *not* generate a color_buf longer than
@@ -647,7 +740,7 @@ parse_diff_color (void)
           state = PS_FAIL;	/* Assume failure...  */
           if (*(p++) == '=')/* It *should* be...  */
             {
-              for (ind_no = 0; indicator_name[ind_no] != NULL; ++ind_no)
+              for (ind_no = 0; indicator_name[ind_no] != nullptr; ++ind_no)
                 {
                   if (STREQ (label, indicator_name[ind_no]))
                     {
@@ -691,7 +784,7 @@ parse_diff_color (void)
       error (0, 0,
              _("unparsable value for --palette"));
       free (color_buf);
-      for (e = color_ext_list; e != NULL; /* empty */)
+      for (e = color_ext_list; e != nullptr; /* empty */)
         {
           e2 = e;
           e = e->next;
@@ -770,21 +863,21 @@ c_escape (char const *str)
       char c = *s;
 
       if (c == ' ')
-	{
-	  must_quote = true;
-	  continue;
-	}
+        {
+          must_quote = true;
+          continue;
+        }
       switch (c_escape_char (*s))
-	{
-	  case 1:
-	    plus += 3;
-	    /* fall through */
-	  case 0:
-	    break;
-	  default:
-	    plus++;
-	    break;
-	}
+        {
+          case 1:
+            plus += 3;
+            /* fall through */
+          case 0:
+            break;
+          default:
+            plus++;
+            break;
+        }
     }
 
   if (must_quote || plus)
@@ -795,27 +888,27 @@ c_escape (char const *str)
 
       *b++ = '"';
       for (s = str; *s; s++)
-	{
-	  char c = *s;
-	  char escape = c_escape_char (c);
+        {
+          char c = *s;
+          char escape = c_escape_char (c);
 
-	  switch (escape)
-	    {
-	      case 0:
-		*b++ = c;
-		break;
-	      case 1:
-		*b++ = '\\';
-		*b++ = ((c >> 6) & 03) + '0';
-		*b++ = ((c >> 3) & 07) + '0';
-		*b++ = ((c >> 0) & 07) + '0';
-		break;
-	      default:
-		*b++ = '\\';
-		*b++ = escape;
-		break;
-	    }
-	}
+          switch (escape)
+            {
+              case 0:
+                *b++ = c;
+                break;
+              case 1:
+                *b++ = '\\';
+                *b++ = ((c >> 6) & 03) + '0';
+                *b++ = ((c >> 3) & 07) + '0';
+                *b++ = ((c >> 0) & 07) + '0';
+                break;
+              default:
+                *b++ = '\\';
+                *b++ = escape;
+                break;
+            }
+        }
       *b++ = '"';
       *b = 0;
       return buffer;
@@ -842,14 +935,21 @@ begin_output (void)
      of the pathnames, and it requires two spaces after "diff" if
      there are no options.  These requirements are silly and do not
      match historical practice.  */
-  name = xasprintf ("diff%s %s %s", switch_string, names[0], names[1]);
+  name = xmalloc (sizeof "diff" + strlen (switch_string)
+		  + 1 + strlen (names[0]) + 1 + strlen (names[1]));
+  char *p = stpcpy (name, "diff");
+  p = stpcpy (p, switch_string);
+  *p++ = ' ';
+  p = stpcpy (p, names[0]);
+  *p++ = ' ';
+  strcpy (p, names[1]);
 
   if (paginate)
     {
       char const *argv[4];
 
       if (fflush (stdout) != 0)
-	pfatal_with_name (_("write failed"));
+        pfatal_with_name (_("write failed"));
 
       argv[0] = pr_program;
       argv[1] = "-h";
@@ -859,44 +959,44 @@ begin_output (void)
       /* Make OUTFILE a pipe to a subsidiary 'pr'.  */
       {
 #if HAVE_WORKING_FORK
-	int pipes[2];
+        int pipes[2];
 
-	if (pipe (pipes) != 0)
-	  pfatal_with_name ("pipe");
+        if (pipe (pipes) != 0)
+          pfatal_with_name ("pipe");
 
-	pr_pid = fork ();
-	if (pr_pid < 0)
-	  pfatal_with_name ("fork");
+        pr_pid = fork ();
+        if (pr_pid < 0)
+          pfatal_with_name ("fork");
 
-	if (pr_pid == 0)
-	  {
-	    close (pipes[1]);
-	    if (pipes[0] != STDIN_FILENO)
-	      {
-		if (dup2 (pipes[0], STDIN_FILENO) < 0)
-		  pfatal_with_name ("dup2");
-		close (pipes[0]);
-	      }
+        if (pr_pid == 0)
+          {
+            close (pipes[1]);
+            if (pipes[0] != STDIN_FILENO)
+              {
+                if (dup2 (pipes[0], STDIN_FILENO) < 0)
+                  pfatal_with_name ("dup2");
+                close (pipes[0]);
+              }
 
-	    execv (pr_program, (char **) argv);
-	    _exit (errno == ENOENT ? 127 : 126);
-	  }
-	else
-	  {
-	    close (pipes[0]);
-	    outfile = fdopen (pipes[1], "w");
-	    if (!outfile)
-	      pfatal_with_name ("fdopen");
-	    check_color_output (true);
-	  }
+            execv (pr_program, (char **) argv);
+            _exit (errno == ENOENT ? 127 : 126);
+          }
+        else
+          {
+            close (pipes[0]);
+            outfile = fdopen (pipes[1], "w");
+            if (!outfile)
+              pfatal_with_name ("fdopen");
+            check_color_output (true);
+          }
 #else
-	char *command = system_quote_argv (SCI_SYSTEM, (char **) argv);
-	errno = 0;
-	outfile = popen (command, "w");
-	if (!outfile)
-	  pfatal_with_name (command);
-	check_color_output (true);
-	free (command);
+        char *command = system_quote_argv (SCI_SYSTEM, (char **) argv);
+        errno = 0;
+        outfile = popen (command, "w");
+        if (!outfile)
+          pfatal_with_name (command);
+        check_color_output (true);
+        free (command);
 #endif
       }
     }
@@ -909,9 +1009,9 @@ begin_output (void)
       check_color_output (false);
 
       /* If handling multiple files (because scanning a directory),
-	 print which files the following output is about.  */
+         print which files the following output is about.  */
       if (currently_recursive)
-	printf ("%s\n", name);
+        printf ("%s\n", name);
     }
 
   free (name);
@@ -949,30 +1049,30 @@ finish_output (void)
       int wstatus;
       int werrno = 0;
       if (ferror (outfile))
-	fatal ("write failed");
+        fatal ("write failed");
 #if ! HAVE_WORKING_FORK
       wstatus = pclose (outfile);
       if (wstatus == -1)
-	werrno = errno;
+        werrno = errno;
 #else
       if (fclose (outfile) != 0)
-	pfatal_with_name (_("write failed"));
+        pfatal_with_name (_("write failed"));
       if (waitpid (pr_pid, &wstatus, 0) < 0)
-	pfatal_with_name ("waitpid");
+        pfatal_with_name ("waitpid");
 #endif
       status = (! werrno && WIFEXITED (wstatus)
-		? WEXITSTATUS (wstatus)
-		: INT_MAX);
+                ? WEXITSTATUS (wstatus)
+                : INT_MAX);
       if (status)
-	die (EXIT_TROUBLE, werrno,
-	       _(status == 126
-		 ? "subsidiary program '%s' could not be invoked"
-		 : status == 127
-		 ? "subsidiary program '%s' not found"
-		 : status == INT_MAX
-		 ? "subsidiary program '%s' failed"
-		 : "subsidiary program '%s' failed (exit status %d)"),
-	       pr_program, status);
+        die (EXIT_TROUBLE, werrno,
+               _(status == 126
+                 ? "subsidiary program '%s' could not be invoked"
+                 : status == 127
+                 ? "subsidiary program '%s' not found"
+                 : status == INT_MAX
+                 ? "subsidiary program '%s' failed"
+                 : "subsidiary program '%s' failed (exit status %d)"),
+               pr_program, status);
     }
 
   outfile = 0;
@@ -998,143 +1098,143 @@ lines_differ (char const *s1, char const *s2)
 
       /* Test for exact char equality first, since it's a common case.  */
       if (c1 != c2)
-	{
-	  switch (ignore_white_space)
-	    {
-	    case IGNORE_ALL_SPACE:
-	      /* For -w, just skip past any white space.  */
-	      while (isspace (c1) && c1 != '\n') c1 = *t1++;
-	      while (isspace (c2) && c2 != '\n') c2 = *t2++;
-	      break;
+        {
+          switch (ignore_white_space)
+            {
+            case IGNORE_ALL_SPACE:
+              /* For -w, just skip past any white space.  */
+              while (isspace (c1) && c1 != '\n') c1 = *t1++;
+              while (isspace (c2) && c2 != '\n') c2 = *t2++;
+              break;
 
-	    case IGNORE_SPACE_CHANGE:
-	      /* For -b, advance past any sequence of white space in
-		 line 1 and consider it just one space, or nothing at
-		 all if it is at the end of the line.  */
-	      if (isspace (c1))
-		{
-		  while (c1 != '\n')
-		    {
-		      c1 = *t1++;
-		      if (! isspace (c1))
-			{
-			  --t1;
-			  c1 = ' ';
-			  break;
-			}
-		    }
-		}
+            case IGNORE_SPACE_CHANGE:
+              /* For -b, advance past any sequence of white space in
+                 line 1 and consider it just one space, or nothing at
+                 all if it is at the end of the line.  */
+              if (isspace (c1))
+                {
+                  while (c1 != '\n')
+                    {
+                      c1 = *t1++;
+                      if (! isspace (c1))
+                        {
+                          --t1;
+                          c1 = ' ';
+                          break;
+                        }
+                    }
+                }
 
-	      /* Likewise for line 2.  */
-	      if (isspace (c2))
-		{
-		  while (c2 != '\n')
-		    {
-		      c2 = *t2++;
-		      if (! isspace (c2))
-			{
-			  --t2;
-			  c2 = ' ';
-			  break;
-			}
-		    }
-		}
+              /* Likewise for line 2.  */
+              if (isspace (c2))
+                {
+                  while (c2 != '\n')
+                    {
+                      c2 = *t2++;
+                      if (! isspace (c2))
+                        {
+                          --t2;
+                          c2 = ' ';
+                          break;
+                        }
+                    }
+                }
 
-	      if (c1 != c2)
-		{
-		  /* If we went too far when doing the simple test
-		     for equality, go back to the first non-white-space
-		     character in both sides and try again.  */
-		  if (c2 == ' ' && c1 != '\n'
-		      && s1 + 1 < t1
-		      && isspace ((unsigned char) t1[-2]))
-		    {
-		      --t1;
-		      continue;
-		    }
-		  if (c1 == ' ' && c2 != '\n'
-		      && s2 + 1 < t2
-		      && isspace ((unsigned char) t2[-2]))
-		    {
-		      --t2;
-		      continue;
-		    }
-		}
+              if (c1 != c2)
+                {
+                  /* If we went too far when doing the simple test
+                     for equality, go back to the first non-white-space
+                     character in both sides and try again.  */
+                  if (c2 == ' ' && c1 != '\n'
+                      && s1 + 1 < t1
+                      && isspace ((unsigned char) t1[-2]))
+                    {
+                      --t1;
+                      continue;
+                    }
+                  if (c1 == ' ' && c2 != '\n'
+                      && s2 + 1 < t2
+                      && isspace ((unsigned char) t2[-2]))
+                    {
+                      --t2;
+                      continue;
+                    }
+                }
 
-	      break;
+              break;
 
-	    case IGNORE_TRAILING_SPACE:
-	    case IGNORE_TAB_EXPANSION_AND_TRAILING_SPACE:
-	      if (isspace (c1) && isspace (c2))
-		{
-		  unsigned char c;
-		  if (c1 != '\n')
-		    {
-		      char const *p = t1;
-		      while ((c = *p) != '\n' && isspace (c))
-			++p;
-		      if (c != '\n')
-			break;
-		    }
-		  if (c2 != '\n')
-		    {
-		      char const *p = t2;
-		      while ((c = *p) != '\n' && isspace (c))
-			++p;
-		      if (c != '\n')
-			break;
-		    }
-		  /* Both lines have nothing but whitespace left.  */
-		  return false;
-		}
-	      if (ignore_white_space == IGNORE_TRAILING_SPACE)
-		break;
-	      FALLTHROUGH;
-	    case IGNORE_TAB_EXPANSION:
-	      if ((c1 == ' ' && c2 == '\t')
-		  || (c1 == '\t' && c2 == ' '))
-		{
-		  size_t column2 = column;
-		  for (;; c1 = *t1++)
-		    {
-		      if (c1 == ' ')
-			column++;
-		      else if (c1 == '\t')
-			column += tabsize - column % tabsize;
-		      else
-			break;
-		    }
-		  for (;; c2 = *t2++)
-		    {
-		      if (c2 == ' ')
-			column2++;
-		      else if (c2 == '\t')
-			column2 += tabsize - column2 % tabsize;
-		      else
-			break;
-		    }
-		  if (column != column2)
-		    return true;
-		}
-	      break;
+            case IGNORE_TRAILING_SPACE:
+            case IGNORE_TAB_EXPANSION_AND_TRAILING_SPACE:
+              if (isspace (c1) && isspace (c2))
+                {
+                  unsigned char c;
+                  if (c1 != '\n')
+                    {
+                      char const *p = t1;
+                      while ((c = *p) != '\n' && isspace (c))
+                        ++p;
+                      if (c != '\n')
+                        break;
+                    }
+                  if (c2 != '\n')
+                    {
+                      char const *p = t2;
+                      while ((c = *p) != '\n' && isspace (c))
+                        ++p;
+                      if (c != '\n')
+                        break;
+                    }
+                  /* Both lines have nothing but whitespace left.  */
+                  return false;
+                }
+              if (ignore_white_space == IGNORE_TRAILING_SPACE)
+                break;
+              FALLTHROUGH;
+            case IGNORE_TAB_EXPANSION:
+              if ((c1 == ' ' && c2 == '\t')
+                  || (c1 == '\t' && c2 == ' '))
+                {
+                  size_t column2 = column;
+                  for (;; c1 = *t1++)
+                    {
+                      if (c1 == ' ')
+                        column++;
+                      else if (c1 == '\t')
+                        column += tabsize - column % tabsize;
+                      else
+                        break;
+                    }
+                  for (;; c2 = *t2++)
+                    {
+                      if (c2 == ' ')
+                        column2++;
+                      else if (c2 == '\t')
+                        column2 += tabsize - column2 % tabsize;
+                      else
+                        break;
+                    }
+                  if (column != column2)
+                    return true;
+                }
+              break;
 
-	    case IGNORE_NO_WHITE_SPACE:
-	      break;
-	    }
+            case IGNORE_NO_WHITE_SPACE:
+              break;
+            }
 
-	  /* Lowercase all letters if -i is specified.  */
+          /* Lowercase all letters if -i is specified.  */
 
-	  if (ignore_case)
-	    {
-	      c1 = tolower (c1);
-	      c2 = tolower (c2);
-	    }
+          if (ignore_case)
+            {
+              c1 = tolower (c1);
+              c2 = tolower (c2);
+            }
 
-	  if (c1 != c2)
-	    break;
-	}
+          if (c1 != c2)
+            break;
+        }
       if (c1 == '\n')
-	return false;
+        return false;
 
       column += c1 == '\t' ? tabsize - column % tabsize : 1;
     }
@@ -1145,13 +1245,13 @@ lines_differ (char const *s1, char const *s2)
 /* Find the consecutive changes at the start of the script START.
    Return the last link before the first gap.  */
 
-struct change * _GL_ATTRIBUTE_CONST
+struct change * ATTRIBUTE_CONST
 find_change (struct change *start)
 {
   return start;
 }
 
-struct change * _GL_ATTRIBUTE_CONST
+struct change * ATTRIBUTE_CONST
 find_reverse_change (struct change *start)
 {
   return start;
@@ -1170,8 +1270,8 @@ find_reverse_change (struct change *start)
 
 void
 print_script (struct change *script,
-	      struct change * (*hunkfun) (struct change *),
-	      void (*printfun) (struct change *))
+              struct change * (*hunkfun) (struct change *),
+              void (*printfun) (struct change *))
 {
   struct change *next = script;
 
@@ -1184,7 +1284,7 @@ print_script (struct change *script,
       end = (*hunkfun) (next);
 
       /* Disconnect them from the rest of the changes,
-	 making them a hunk, and remember the rest for next iteration.  */
+         making them a hunk, and remember the rest for next iteration.  */
       next = end->link;
       end->link = 0;
 #ifdef DEBUG
@@ -1234,14 +1334,14 @@ print_1_line_nl (char const *line_flag, char const *const *line, bool skip_nl)
       char const *line_flag_1 = line_flag;
 
       if (suppress_blank_empty && **line == '\n')
-	{
-	  flag_format_1 = "%s";
+        {
+          flag_format_1 = "%s";
 
-	  /* This hack to omit trailing blanks takes advantage of the
-	     fact that the only way that LINE_FLAG can end in a blank
-	     is when LINE_FLAG consists of a single blank.  */
-	  line_flag_1 += *line_flag_1 == ' ';
-	}
+          /* This hack to omit trailing blanks takes advantage of the
+             fact that the only way that LINE_FLAG can end in a blank
+             is when LINE_FLAG consists of a single blank.  */
+          line_flag_1 += *line_flag_1 == ' ';
+        }
 
       fprintf (out, flag_format_1, line_flag_1);
     }
@@ -1262,7 +1362,7 @@ print_1_line_nl (char const *line_flag, char const *const *line, bool skip_nl)
 
 void
 output_1_line (char const *base, char const *limit, char const *flag_format,
-	       char const *line_flag)
+               char const *line_flag)
 {
   const size_t MAX_CHUNK = 1024;
   if (!expand_tabs)
@@ -1393,20 +1493,18 @@ char const change_letter[] = { 0, 'd', 'a', 'c' };
    Internal line numbers count from 0 starting after the prefix.
    Actual line numbers count from 1 within the entire file.  */
 
-lin _GL_ATTRIBUTE_PURE
+lin ATTRIBUTE_PURE
 translate_line_number (struct file_data const *file, lin i)
 {
   return i + file->prefix_lines + 1;
 }
 
-/* Translate a line number range.  This is always done for printing,
-   so for convenience translate to printint rather than lin, so that the
-   caller can use printf with "%"pI"d" without casting.  */
+/* Translate a line number range.  */
 
 void
 translate_range (struct file_data const *file,
-		 lin a, lin b,
-		 printint *aptr, printint *bptr)
+                 lin a, lin b,
+                 lin *aptr, lin *bptr)
 {
   *aptr = translate_line_number (file, a - 1) + 1;
   *bptr = translate_line_number (file, b + 1) - 1;
@@ -1421,7 +1519,7 @@ translate_range (struct file_data const *file,
 void
 print_number_range (char sepchar, struct file_data *file, lin a, lin b)
 {
-  printint trans_a, trans_b;
+  lin trans_a, trans_b;
   translate_range (file, a, b, &trans_a, &trans_b);
 
   /* Note: we can have B < A in the case of a range of no lines.
@@ -1448,8 +1546,8 @@ print_number_range (char sepchar, struct file_data *file, lin a, lin b)
 
 enum changes
 analyze_hunk (struct change *hunk,
-	      lin *first0, lin *last0,
-	      lin *first1, lin *last1)
+              lin *first0, lin *last0,
+              lin *first1, lin *last1)
 {
   struct change *next;
   lin l0, l1;
@@ -1482,46 +1580,46 @@ analyze_hunk (struct change *hunk,
       show_to += next->inserted;
 
       for (i = next->line0; i <= l0 && trivial; i++)
-	{
-	  char const *line = linbuf0[i];
-	  char const *lastbyte = linbuf0[i + 1] - 1;
-	  char const *newline = lastbyte + (*lastbyte != '\n');
-	  size_t len = newline - line;
-	  char const *p = line;
-	  if (skip_white_space)
-	    for (; *p != '\n'; p++)
-	      if (! isspace ((unsigned char) *p))
-		{
-		  if (! skip_leading_white_space)
-		    p = line;
-		  break;
-		}
-	  if (newline - p != trivial_length
-	      && (! ignore_regexp.fastmap
-		  || re_search (&ignore_regexp, line, len, 0, len, 0) < 0))
-	    trivial = 0;
-	}
+        {
+          char const *line = linbuf0[i];
+          char const *lastbyte = linbuf0[i + 1] - 1;
+          char const *newline = lastbyte + (*lastbyte != '\n');
+          size_t len = newline - line;
+          char const *p = line;
+          if (skip_white_space)
+            for (; *p != '\n'; p++)
+              if (! isspace ((unsigned char) *p))
+                {
+                  if (! skip_leading_white_space)
+                    p = line;
+                  break;
+                }
+          if (newline - p != trivial_length
+              && (! ignore_regexp.fastmap
+                  || re_search (&ignore_regexp, line, len, 0, len, 0) < 0))
+            trivial = 0;
+        }
 
       for (i = next->line1; i <= l1 && trivial; i++)
-	{
-	  char const *line = linbuf1[i];
-	  char const *lastbyte = linbuf1[i + 1] - 1;
-	  char const *newline = lastbyte + (*lastbyte != '\n');
-	  size_t len = newline - line;
-	  char const *p = line;
-	  if (skip_white_space)
-	    for (; *p != '\n'; p++)
-	      if (! isspace ((unsigned char) *p))
-		{
-		  if (! skip_leading_white_space)
-		    p = line;
-		  break;
-		}
-	  if (newline - p != trivial_length
-	      && (! ignore_regexp.fastmap
-		  || re_search (&ignore_regexp, line, len, 0, len, 0) < 0))
-	    trivial = 0;
-	}
+        {
+          char const *line = linbuf1[i];
+          char const *lastbyte = linbuf1[i + 1] - 1;
+          char const *newline = lastbyte + (*lastbyte != '\n');
+          size_t len = newline - line;
+          char const *p = line;
+          if (skip_white_space)
+            for (; *p != '\n'; p++)
+              if (! isspace ((unsigned char) *p))
+                {
+                  if (! skip_leading_white_space)
+                    p = line;
+                  break;
+                }
+          if (newline - p != trivial_length
+              && (! ignore_regexp.fastmap
+                  || re_search (&ignore_regexp, line, len, 0, len, 0) < 0))
+            trivial = 0;
+        }
     }
   while ((next = next->link) != 0);
 
@@ -1537,40 +1635,16 @@ analyze_hunk (struct change *hunk,
   return (show_from ? OLD : UNCHANGED) | (show_to ? NEW : UNCHANGED);
 }
 
-/* Concatenate three strings, returning a newly malloc'd string.  */
-
-char *
-concat (char const *s1, char const *s2, char const *s3)
-{
-  char *new = xmalloc (strlen (s1) + strlen (s2) + strlen (s3) + 1);
-  sprintf (new, "%s%s%s", s1, s2, s3);
-  return new;
-}
-
-/* Yield a new block of SIZE bytes, initialized to zero.  */
-
-void *
-zalloc (size_t size)
-{
-  void *p = xmalloc (size);
-  memset (p, 0, size);
-  return p;
-}
-
+#ifdef DEBUG
 void
 debug_script (struct change *sp)
 {
   fflush (stdout);
 
   for (; sp; sp = sp->link)
-    {
-      printint line0 = sp->line0;
-      printint line1 = sp->line1;
-      printint deleted = sp->deleted;
-      printint inserted = sp->inserted;
-      fprintf (stderr, "%3"pI"d %3"pI"d delete %"pI"d insert %"pI"d\n",
-	       line0, line1, deleted, inserted);
-    }
+    fprintf (stderr, "%3"pI"d %3"pI"d delete %"pI"d insert %"pI"d\n",
+	     sp->line0, sp->line1, sp->deleted, sp->inserted);
 
   fflush (stderr);
 }
+#endif
